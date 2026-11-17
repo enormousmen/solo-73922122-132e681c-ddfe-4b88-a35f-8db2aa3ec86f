@@ -17,6 +17,13 @@ baseline (identical seed + config):
                                          new) checkpoint, resume reproduces
                                          G-baseline
   H   service basics                  -> /, /docs, 404s before first checkpoint
+  I   dataset binding                 -> see scenario_dataset_binding()
+
+Scenarios A–H use the shipped dataset.  Scenario I copies the dataset to a
+temp path and exercises checkpoint/data binding over real server restarts:
+values changed, row order changed, file deleted, CSV edited during a run,
+legacy checkpoints without an identity, forced restart on the new CSV, and
+resume after restoring the original data.
 
 Exit code 0 iff every scenario passes.  Run from the repo root:
 
@@ -35,6 +42,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -90,14 +98,15 @@ def api_bytes(port: int, path: str) -> bytes:
 # ------------------------------------------------------------------ servers
 
 class Server:
-    def __init__(self, runs_dir: Path, log_dir: Path, tag: str):
+    def __init__(self, runs_dir: Path, log_dir: Path, tag: str,
+                 config_path: Path | None = None):
         self.runs_dir = runs_dir
         self.port = _free_port()
         self.tag = tag
         log = open(log_dir / f"server-{tag}.log", "wb")
         env = dict(os.environ)
         env["RUNS_DIR"] = str(runs_dir)
-        env["CONFIG_PATH"] = str(ROOT / "config" / "default.json")
+        env["CONFIG_PATH"] = str(config_path or ROOT / "config" / "default.json")
         env["ENABLE_TEST_CRASH_ENDPOINT"] = "1"
         self.proc = subprocess.Popen(
             [PY, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1",
@@ -419,6 +428,348 @@ def scenario_kill_mid_save(runs_dir: Path, log_dir: Path, server: Server) -> Ser
     return server2
 
 
+# ------------------------------------------------- dataset binding scenario
+
+def _write_cfg(work: Path, dataset_path: Path) -> Path:
+    """A service config identical to config/default.json but with a temp CSV."""
+    cfg = json.loads((ROOT / "config" / "default.json").read_text())
+    cfg["dataset_path"] = str(dataset_path)
+    path = work / "config.json"
+    path.write_text(json.dumps(cfg))
+    return path
+
+
+def _read_csv(path: Path) -> tuple[list[str], list[list[str]]]:
+    import csv as _csv
+    with open(path, newline="", encoding="utf-8") as f:
+        rows = list(_csv.reader(f))
+    return rows[0], rows[1:]
+
+
+def _write_csv(path: Path, header: list[str], rows: list[list[str]]) -> None:
+    import csv as _csv
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        w = _csv.writer(f)
+        w.writerow(header)
+        w.writerows(rows)
+    os.replace(tmp, path)
+
+
+def _assert_blocked(name: str, port: int, want_type: str,
+                    status_code: int = 409) -> dict:
+    code, body = api(port, "POST", "/train/resume")
+    detail = str(body.get("detail", ""))
+    ok = (code == status_code and want_type in detail
+          and "force" in detail)
+    record(name, ok, f"{code}: {detail[:90]}")
+    return body
+
+
+def _restart(cur: Server, runs_dir: Path, log_dir: Path, tag: str,
+             cfg_path: Path) -> Server:
+    """Kill a server and start a fresh process on the same runs dir."""
+    cur.kill()
+    return Server(runs_dir, log_dir, tag, config_path=cfg_path)
+
+
+def scenario_dataset_binding(work: Path, log_dir: Path) -> dict:
+    """Checkpoint <-> dataset identity binding across real server restarts.
+
+    Three private datasets/runs dirs are used so nothing else is touched:
+
+      * base/      uninterrupted baseline on a copy of the CSV
+      * edit/      a run whose CSV is edited while it trains (must be unaffected)
+      * conflict/  a paused run used to test changed / reordered / missing CSVs,
+                   restore-and-resume, force start on new data, legacy payloads
+    """
+    print("\n== I: checkpoint is bound to the samples it was trained on ==")
+    root = work / "binding"
+    root.mkdir()
+    cfg = {"epochs": 3, "batch_size": 32, "batch_sleep_seconds": 0.01,
+           "checkpoint_every": 1}
+    header, rows = _read_csv(ROOT / "data" / "classification.csv")
+    original_bytes = (ROOT / "data" / "classification.csv").read_bytes()
+
+    def make_area(name: str) -> tuple[Path, Path, Path]:
+        area = root / name
+        area.mkdir()
+        data = area / "dataset.csv"
+        data.write_bytes(original_bytes)
+        runs = area / "runs"
+        return data, runs, _write_cfg(area, data)
+
+    def restart(cur: Server, tag: str, runs_dir: Path) -> Server:
+        cur.kill()
+        new = Server(runs_dir, log_dir, tag, config_path=cfg_path)
+        live["server"] = new
+        return new
+
+    live: dict[str, Server] = {}
+
+    # ---------------------------------------------------- uninterrupted base
+    d_base, r_base, cfg_base = make_area("base")
+    live["server"] = Server(r_base, log_dir, "I0-base", config_path=cfg_base)
+    try:
+        wait_state(live["server"].port, "idle")
+        ref_losses, ref_params = run_to_finish(live["server"].port, cfg)
+        record("I0 uninterrupted baseline on a dataset copy",
+               len(ref_losses) == 57, f"{len(ref_losses)} batches")
+    finally:
+        live["server"].kill()
+
+    # ------------------------------------ CSV edited while a run is training
+    d_edit, r_edit, cfg_edit = make_area("edit")
+    server = Server(r_edit, log_dir, "I1-edit", config_path=cfg_edit)
+    live["server"] = server
+    cfg_path = cfg_edit
+    try:
+        st = start_run(server.port, cfg)["dataset"]
+        record("I1 fresh run records a dataset identity",
+               st["state"] == "current"
+               and st["bound"]["fingerprint"].startswith("sha256:")
+               and st["current"]["fingerprint"] == st["bound"]["fingerprint"],
+               f"{st['current']['num_samples']} samples, "
+               f"{st['bound']['fingerprint'][:19]}...")
+        bound_fp = st["bound"]["fingerprint"]
+        bound_sha = st["bound"]["file_sha256"]
+        wait_until(server.port, lambda s: s["completed_batches"] >= 20)
+        edited_rows = [list(r) for r in rows]
+        edited_rows[0][0] = str(float(edited_rows[0][0]) + 10.0)
+        _write_csv(d_edit, header, edited_rows)
+        wait_state(server.port, "finished")
+        _, losses = api(server.port, "GET", "/train/losses")
+        params = api_bytes(server.port, "/train/parameters")
+        record("I2a CSV edit during a run does not change loaded data",
+               losses["losses"] == ref_losses and _params_equal(params, ref_params),
+               "losses & final params identical to the uninterrupted baseline")
+        server = restart(server, "I2-edit-restart", r_edit)
+        st = api(server.port, "GET", "/train/status")[1]
+        record("I2b startup after the edit still reports the original identity",
+               st["dataset"]["state"] == "changed"
+               and st["dataset"]["matches_bound"] is False
+               and st["dataset"]["bound"]["fingerprint"] == bound_fp
+               and st["dataset"]["bound"]["file_sha256"] == bound_sha
+               and st["dataset"]["current"]["file_sha256"] != bound_sha,
+               "the checkpoint kept the samples it was trained on")
+    finally:
+        live["server"].kill()
+
+    # ------------------------- paused run vs changed / reordered / missing CSV
+    d_c, r_c, cfg_c = make_area("conflict")
+    cfg_path = cfg_c
+    ckpt_file = r_c / "checkpoint.pt"
+    server = Server(r_c, log_dir, "I3-paused", config_path=cfg_c)
+    live["server"] = server
+    try:
+        start_run(server.port, cfg)
+        wait_until(server.port, lambda s: s["completed_batches"] >= 10
+                   and s["last_checkpoint_at"] is not None)
+        code, st = api(server.port, "POST", "/train/pause")
+        record("I3a paused run has a complete checkpoint",
+               code == 200 and st["state"] == "paused"
+               and st["dataset"]["state"] == "current")
+        ckpt_hash = hashlib.sha256(ckpt_file.read_bytes()).hexdigest()
+
+        # --- values changed on disk, then restart -------------------------
+        changed_rows = [list(r) for r in rows]
+        changed_rows[0][0] = str(float(changed_rows[0][0]) + 10.0)
+        _write_csv(d_c, header, changed_rows)
+        server = restart(server, "I3-changed", r_c)
+        st = api(server.port, "GET", "/train/status")[1]
+        code, ds = api(server.port, "GET", "/dataset/status")
+        record("I3b0 GET /dataset/status reports the change",
+               code == 200 and ds["state"] == "changed"
+               and ds["matches_bound"] is False
+               and ds["bound"]["fingerprint"] != ds["current"]["fingerprint"],
+               f"{ds['state']}")
+        record("I3b restart detects changed dataset",
+               bool(st["data_conflict"])
+               and st["data_conflict"]["type"] == "dataset_changed"
+               and st["ready_to_resume"] is False
+               and st["dataset"]["state"] == "changed",
+               st["data_conflict"]["type"] if st["data_conflict"] else "no conflict")
+        _assert_blocked("I3c resume refused with a queryable reason", server.port,
+                        "dataset_changed")
+        record("I3d old checkpoint left untouched",
+               hashlib.sha256(ckpt_file.read_bytes()).hexdigest() == ckpt_hash)
+        code, _ = api(server.port, "POST", "/train/start", {"config": cfg})
+        record("I3e non-force start also refused", code == 409)
+
+        # --- same values, only two rows swapped ---------------------------
+        swapped = [list(r) for r in rows]
+        swapped[0], swapped[1] = swapped[1], swapped[0]
+        _write_csv(d_c, header, swapped)
+        server = restart(server, "I3-order", r_c)
+        st = api(server.port, "GET", "/train/status")[1]
+        record("I4 row reorder alone is a different dataset",
+               bool(st["data_conflict"])
+               and st["data_conflict"]["type"] == "dataset_changed",
+               "row order is part of the identity")
+        _assert_blocked("I4b resume refused after row reorder", server.port,
+                        "dataset_changed")
+
+        # --- original file deleted ----------------------------------------
+        d_c.unlink()
+        server = restart(server, "I3-missing", r_c)
+        st = api(server.port, "GET", "/train/status")[1]
+        record("I5a missing original file is reported",
+               bool(st["data_conflict"])
+               and st["data_conflict"]["type"] == "dataset_unavailable"
+               and st["dataset"]["state"] == "missing"
+               and st["dataset"]["loaded_in_memory"] is False,
+               st["data_conflict"]["type"] if st["data_conflict"] else "no conflict")
+        _assert_blocked("I5b resume refused while the file is missing",
+                        server.port, "dataset_unavailable")
+        code, _ = api(server.port, "POST", "/train/start", {"config": cfg})
+        record("I5c new run refused while the CSV is missing", code == 400)
+        code, _ = api(server.port, "POST", "/train/start",
+                      {"force": True, "config": cfg})
+        record("I5d force start without a readable CSV is refused", code == 400)
+        record("I5e old checkpoint still kept untouched",
+               hashlib.sha256(ckpt_file.read_bytes()).hexdigest() == ckpt_hash)
+        code, body = api(server.port, "GET", "/train/archived")
+        record("I5f archived list is queryable", code == 200 and body["count"] == 0)
+
+        # --- restore the original bytes, no restart -> resume works --------
+        d_c.write_bytes(original_bytes)
+        code, ds = api(server.port, "GET", "/dataset/status")
+        record("I5g re-verification on resume notices restored data "
+               "(no restart needed)",
+               code == 200 and ds["state"] == "current" and ds["matches_bound"],
+               f"dataset state after restore: {ds['state']}")
+        code, st = api(server.port, "POST", "/train/resume")
+        record("I6a restoring the original data allows resume without a restart",
+               code == 200 and st.get("state") == "running",
+               f"state={st.get('state')}")
+        wait_state(server.port, "finished")
+        _, losses = api(server.port, "GET", "/train/losses")
+        params = api_bytes(server.port, "/train/parameters")
+        compare_to_baseline("I6b restored-data resume is bit-exact",
+                            ref_losses, ref_params, losses["losses"], params)
+
+        # --- a genuinely new CSV + force start -> archive + new run -------
+        new_rows = [list(r) for r in rows]
+        for r in new_rows:
+            r[0] = str(round(float(r[0]) * 0.5, 6))
+            r[1] = str(round(float(r[1]) * 0.5, 6))
+        _write_csv(d_c, header, new_rows)
+        server = restart(server, "I7-forced", r_c)
+        code, st = api(server.port, "POST", "/train/start",
+                       {"force": True, "config": cfg})
+        record("I7a force start accepted on the current CSV", code == 200,
+               f"run={st.get('run_id')}")
+        record("I7b new run is bound to the new data",
+               st["dataset"]["state"] == "current"
+               and st["dataset"]["bound"]["fingerprint"] != bound_fp
+               and st["dataset"]["bound"]["file_sha256"]
+               == st["dataset"]["current"]["file_sha256"],
+               st["dataset"]["bound"]["fingerprint"][:19] + "...")
+        _, body = api(server.port, "GET", "/train/archived")
+        archived = body.get("archived") or []
+        record("I7c old checkpoint archived with a reason (not deleted)",
+               len(archived) == 1
+               and archived[0]["reason_type"] == "dataset_changed"
+               and (r_c / "archive" / archived[0]["checkpoint_file"]).exists(),
+               archived[0]["reason_type"] if archived else "nothing archived")
+        wait_state(server.port, "finished")
+        _, forced = api(server.port, "GET", "/train/losses")
+        record("I7d forced run finishes on the new data",
+               len(forced["losses"]) == len(ref_losses)
+               and forced["losses"] != ref_losses,
+               f"{len(forced['losses'])} batches, final loss "
+               f"{forced['losses'][-1]['loss']:.6f}")
+    finally:
+        live["server"].kill()
+
+    # ---------------------------------------- legacy payload without identity
+    legacy_area = root / "legacy"
+    legacy_area.mkdir()
+    legacy_runs = legacy_area / "runs"
+    legacy_runs.mkdir()
+    legacy_data = legacy_area / "dataset.csv"
+    legacy_data.write_bytes(original_bytes)
+    legacy_cfg = _write_cfg(legacy_area, legacy_data)
+    ckpt = torch.load(ckpt_file, map_location="cpu", weights_only=True)
+    ckpt.pop("dataset", None)
+    ckpt.pop("dataset_fingerprint", None)
+    ckpt["schema_version"] = 1
+    torch.save(ckpt, legacy_runs / "checkpoint.pt")
+    cfg_path = legacy_cfg
+    server = Server(legacy_runs, log_dir, "I8-legacy", config_path=legacy_cfg)
+    live["server"] = server
+    try:
+        st = api(server.port, "GET", "/train/status")[1]
+        record("I8a legacy checkpoint is not silently resumed",
+               bool(st["data_conflict"])
+               and st["data_conflict"]["type"] == "legacy_checkpoint"
+               and st["ready_to_resume"] is False
+               and st["dataset"]["state"] == "unverified"
+               and st["state"] == "finished",
+               st["data_conflict"]["type"] if st["data_conflict"] else "no conflict")
+        _assert_blocked("I8b legacy resume refused with a reason", server.port,
+                        "legacy_checkpoint")
+        code, _ = api(server.port, "POST", "/train/start",
+                      {"force": True, "config": cfg})
+        code_arch, body = api(server.port, "GET", "/train/archived")
+        record("I8c force start archives the legacy checkpoint",
+               code == 200 and code_arch == 200
+               and any(a["reason_type"] == "legacy_checkpoint"
+                       for a in body["archived"]),
+               f"{body.get('count', 0)} archived")
+    finally:
+        live["server"].kill()
+
+    # ---------------------------------------- unreadable (torn) checkpoint
+    torn_area = root / "torn"
+    torn_area.mkdir()
+    torn_runs = torn_area / "runs"
+    torn_runs.mkdir()
+    torn_data = torn_area / "dataset.csv"
+    torn_data.write_bytes(original_bytes)
+    torn_cfg = _write_cfg(torn_area, torn_data)
+    (torn_runs / "checkpoint.pt").write_bytes(b"not a torch checkpoint")
+    cfg_path = torn_cfg
+    server = Server(torn_runs, log_dir, "I9-torn", config_path=torn_cfg)
+    live["server"] = server
+    try:
+        st = api(server.port, "GET", "/train/status")[1]
+        record("I9a unreadable checkpoint is reported, not resumed",
+               bool(st["checkpoint_issue"])
+               and st["checkpoint_issue"]["type"] == "checkpoint_unreadable"
+               and st["state"] == "idle",
+               st["checkpoint_issue"]["type"] if st["checkpoint_issue"] else "none")
+        code, _ = api(server.port, "POST", "/train/resume")
+        record("I9b resume with an unreadable checkpoint -> 409", code == 409)
+        code, _ = api(server.port, "POST", "/train/start", {"config": cfg})
+        record("I9c non-force start refused", code == 409)
+        code, st = api(server.port, "POST", "/train/start",
+                       {"force": True, "config": cfg})
+        record("I9d force start archives it and starts a new run", code == 200,
+               f"run={st.get('run_id')}")
+        _, body = api(server.port, "GET", "/train/archived")
+        record("I9e archived reason is checkpoint_unreadable",
+               any(a["reason_type"] == "checkpoint_unreadable"
+                   for a in body["archived"]))
+    finally:
+        live["server"].kill()
+
+    return {"orig_losses": ref_losses, "orig_params": ref_params}
+
+
+def _params_equal(a: bytes, b: bytes) -> bool:
+    sa = torch.load(io.BytesIO(a), weights_only=True)
+    sb = torch.load(io.BytesIO(b), weights_only=True)
+    return sa.keys() == sb.keys() and all(torch.equal(sa[k], sb[k]) for k in sa)
+
+
+def run_to_finish_after_start(port: int) -> dict:
+    st = wait_state(port, "finished")
+    _, losses = api(port, "GET", "/train/losses")
+    st["losses"] = losses["losses"]
+    return st
+
+
 # ---------------------------------------------------------------------- main
 
 def main() -> int:
@@ -448,6 +799,12 @@ def main() -> int:
         server = scenario_kill_mid_save(runs_dir, log_dir, server)
     finally:
         server.stop()
+
+    try:
+        scenario_dataset_binding(work, log_dir)
+    except Exception as exc:  # noqa: BLE001 - a crash here is a failed check
+        record("I dataset binding scenario crashed", False, repr(exc))
+        traceback.print_exc()
 
     print("\n================ SUMMARY ================")
     failed = 0

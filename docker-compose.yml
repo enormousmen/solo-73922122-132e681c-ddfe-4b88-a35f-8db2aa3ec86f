@@ -13,6 +13,11 @@ services:
     volumes:
       # Checkpoints survive `docker kill` + `docker compose start`.
       - trainer-runs:/app/runs
+      # The default CSV is a bind mount so the "replace the CSV" demo is
+      # possible without rebuilding: edit ./data/classification.csv on the
+      # host, then `docker compose restart trainer`.
+      - ./data:/app/data
+      - ./config:/app/config
     restart: unless-stopped
 
 volumes:

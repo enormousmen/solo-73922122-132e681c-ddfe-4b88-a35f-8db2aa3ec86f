@@ -7,10 +7,22 @@ Endpoints (interactive docs at /docs):
     POST /train/start          start a fresh run (optional config overrides, force)
     POST /train/pause          stop training; 200 only after a full checkpoint is persisted
     POST /train/resume         continue from the latest checkpoint / paused state
-    GET  /train/status         progress and checkpoint health
+    GET  /train/status         progress, checkpoint health, dataset identity,
+                               and (if any) the reason resume is blocked
     GET  /train/losses         per-batch loss history
     GET  /train/parameters     download model parameters (.pt) from latest checkpoint
     GET  /train/checkpoint     download the full checkpoint (.pt)
+    GET  /train/archived       checkpoints archived by force-starts (with reasons)
+    GET  /dataset/status       identity of the bound data vs the CSV on disk
+
+Data-binding rules: a resume is only allowed when the CSV at the configured
+``dataset_path`` parses to exactly the same training tensors — same feature
+column names, same values, and the same row order — as the data recorded in
+the checkpoint (formatting-only differences are ignored).  Changed, reordered,
+missing or unparsable CSVs, and legacy checkpoints without an identity, are
+refused (409) with a reason; the old checkpoint is kept.  ``POST /train/start
+{"force": true}`` archives the old checkpoint (never deletes it) and starts on
+the current CSV.
 """
 from __future__ import annotations
 
@@ -82,6 +94,8 @@ def root() -> dict:
             "GET /train/losses",
             "GET /train/parameters",
             "GET /train/checkpoint",
+            "GET /train/archived",
+            "GET /dataset/status",
         ],
     }
 
@@ -141,6 +155,22 @@ def status() -> dict:
     return manager.status()
 
 
+@app.get("/dataset/status")
+def dataset_status() -> dict:
+    """Compare the dataset identity bound to the current/checkpointed run with
+    the CSV currently at ``dataset_path``. ``state`` is one of
+    ``current|changed|missing|invalid|unbound``."""
+    return manager.dataset_status()
+
+
+@app.get("/train/archived")
+def archived() -> dict:
+    """Checkpoints archived by a force-start, newest first, each with the
+    reason it could not be resumed (old checkpoint is kept on disk)."""
+    items = manager.archived_checkpoints()
+    return {"count": len(items), "archived": items}
+
+
 @app.get("/train/losses")
 def losses(
     since_step: int | None = Query(default=None, description="only losses with step > this"),
@@ -156,6 +186,8 @@ def parameters() -> Response:
         data = manager.read_parameters()
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ConflictError as exc:
+        raise _conflict(exc) from exc
     return Response(
         content=data,
         media_type="application/octet-stream",
